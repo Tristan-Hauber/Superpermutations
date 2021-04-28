@@ -1,0 +1,549 @@
+import itertools
+from gurobipy import (GRB, quicksum, Model)
+from time import time
+import string
+from math import factorial as f
+import sys
+
+version = 'TSP S 2020-01-21 v1'
+
+order = 6
+
+NumberOfTimesToRun = 1 # >= 1
+output = 1 # 0 or 1
+removeImproperArcs = 1 # 0 or 1
+
+branchingDirection = 1 # -1, 0 or 1
+lowerBounds = 0 # 0 or 1
+maxDesiredCost = 3 # between 3 and LengthOfPermutations, inclusive
+removeCostOneCycles = 1 # 0 or 1
+removeCostTwoCycles = 1 # 0 or 1
+upperBounds = 0 # 0 or 1
+warmStart = 1 # 0 or 1
+suggestHeuristicSolutions = 1 # 0 or 1
+maxAndMinTransitionsOfCostAssumptions = 0 # 0 or 1
+mipFocus = 3 # 0-3 inclusive
+partitionVariable = -1 # 0-5 inclusive
+if len(sys.argv) > 1:
+    partitionVariable = int(sys.argv[1])
+
+maximumNumberOfSubToursForHeuristicSolution = 5 # 2+
+
+print(partitionVariable)
+
+# =============================================================================
+
+def Overlap(addressOne, addressTwo):
+    # An address of zero corresponds with the zero permutation
+    # If zero, then there is no overlap with the next permutation
+    if addressOne == 0:
+        return 0
+    if addressTwo == 0:
+        return order
+    permOne = Destinations[addressOne]
+    permTwo = Destinations[addressTwo]
+    # If we cannot find the starting variable for the second permutation
+    # within the first, then there is no overlap between the two.
+    if permTwo[0] not in permOne:
+        return 0
+    overlapStartChar = permTwo[0]
+    # 'overlapStarts' lists all possible starting indices for the overlap
+    # between the two permutations. 'overlapCounts' keeps track of the
+    # length of the overlap between the two permutations.
+    overlapStarts = [i for i in range(len(permOne)) if permOne[i] == overlapStartChar]
+    overlapCounts = [order - overlapStarts[i] for i in range(len(overlapStarts))]
+    # Check to see if any of the starting indices allows for overlap
+    # between the two permutations. If so, then the lowest one is chosen.
+    for i in range(len(overlapStarts)):
+        if permOne[overlapStarts[i]:] == permTwo[:overlapCounts[i]]:
+            return overlapCounts[i]
+    # If we get to here, then there is no overlap between the two permutations
+    return 0
+
+def GetUsedXVariables():
+    return set(x for x in X if X[x].x > 0.9)
+
+def FindAllSubTours(usedXVariables):
+    subTours = []
+    # Repeatedly choose a used transition, then follow the transitions
+    # until they form a loop. Save this loop as a set of transitions,
+    # then finally return a list of all loops.
+    while len(usedXVariables) > 0:
+        subTour = list()
+        initialTransition = min(usedXVariables)
+        usedXVariables.remove(initialTransition)
+        subTour.append(initialTransition)
+        destination = initialTransition[1]
+        while destination != initialTransition[0]:
+            for transition in usedXVariables:
+                if transition[0] == destination:
+                    destination = transition[1]
+                    usedXVariables.remove(transition)
+                    subTour.append(transition)
+                    break
+        subTours.append(subTour)
+    return subTours
+
+def Callback(model,where):
+   
+    if where == GRB.Callback.MIPSOL:
+        
+        UsedX = set(k for (k,v) in zip(X.keys(), m.cbGetSolution(X.values())) if v > 0.9)
+        subTours = FindAllSubTours(UsedX)
+        if len(subTours) not in SubTourLengthStats:
+            SubTourLengthStats[len(subTours)] = 1
+        else:
+            SubTourLengthStats[len(subTours)] += 1
+        
+        if len(subTours) > 1:
+            for subTour in subTours:
+                if len(subTour) <= (permCount) / 2:
+                    transversedLocations = set(transition[0] for transition in subTour)
+                    # cut off all maximal loops using only these destinations
+                    model.cbLazy(quicksum(X[i,j]
+                                for i in transversedLocations for j in transversedLocations
+                                if (i,j) in X) <= len(subTour) - 1)
+                    if len(subTour) not in CutStats:
+                        CutStats[len(subTour)] = 1
+                        RemovedCycles[len(subTour)] = [subTour]
+                    else:
+                        CutStats[len(subTour)] += 1
+                        RemovedCycles[len(subTour)].append(subTour)
+        
+        if suggestHeuristicSolutions:
+            if len(subTours) > 1 and len(subTours) <= maximumNumberOfSubToursForHeuristicSolution:
+                print("Looking for heuristic solutions given", len(subTours), "sub-tours...")
+                firstSubTour = list(transition[0] for transition in subTours[0])
+                firstSubTour.append(firstSubTour[0])
+                subTours.remove(subTours[0])
+                while len(subTours) > 0:
+                    #print(subTours[0])
+                    bestPath = None
+                    bestCost = GRB.INFINITY
+                    secondSubTour = list(transition[0] for transition in subTours[0])
+                    for i in range(2,len(firstSubTour)):
+                        for j in range(len(secondSubTour)):
+                            if (firstSubTour[i-1],secondSubTour[j]) in X:
+                                if (secondSubTour[j-1],firstSubTour[i]) in X:
+                                    newPath = firstSubTour[:i] + secondSubTour[j:] + secondSubTour[:j] + firstSubTour[i:]
+                                    transitionList = list((newPath[k-1],newPath[k]) for k in range(1,len(newPath)))
+                                    if sum(Cost[transition] for transition in transitionList) < bestCost:
+                                        bestCost = sum(Cost[transition] for transition in transitionList)
+                                        bestPath = newPath
+                                        #print(len(firstSubTour),len(secondSubTour),i,j)
+                    if bestPath is not None:
+                        subTours.remove(subTours[0])
+                        firstSubTour = bestPath
+                    else:
+                        break
+                if len(subTours) > 0:
+                    print("No heuristic solutions found.")
+                else:
+                    transitionList = list((firstSubTour[k-1],firstSubTour[k]) for k in range(1,len(firstSubTour)))
+                    if sum(Cost[transition] for transition in transitionList) < m._bestObj:
+                        m._bestObj = sum(Cost[transition] for transition in transitionList)
+                        m._bestSol = {}
+                        for x in X:
+                            if x in transitionList:
+                                m._bestSol[x] = 1
+                            else:
+                                m._bestSol[x] = 0
+                        print("Found a solution with cost", m._bestObj)
+                    else:
+                        print("Solutions found were too costly")
+                        
+    if where == GRB.Callback.MIPNODE and m.cbGet(GRB.Callback.MIPNODE_STATUS)==GRB.OPTIMAL:
+
+        if m._bestObj < m.cbGet(GRB.Callback.MIPNODE_OBJBST) and suggestHeuristicSolutions:
+            print('Suggesting a path with objective value', m._bestObj)
+            m.cbSetSolution(list(X[x] for x in X), list(m._bestSol[x] for x in X))
+            m.cbUseSolution()
+            m._bestObj = m.cbGet(GRB.Callback.MIPNODE_OBJBST)
+        
+        XVars = {k:v for (k,v) in zip(X.keys(), m.cbGetNodeRel(X.values())) if v > 0.001}
+        components = IdentifyStrongComponents(XVars)
+        if len(components) > 1:
+            for component in components:
+                if len(component) <= permCount / 2 and \
+                    sum(XVars[i,j] for i in component for j in component if (i,j) in XVars) > len(component)-1+0.02:
+                    model.cbLazy(quicksum(X[i,j] for i in component for j in component if (i,j) in X) <= len(component) - 1)
+                    if len(component) not in StrongComponentCutStats:
+                        StrongComponentCutStats[len(component)] = 1
+                    else:
+                        StrongComponentCutStats[len(component)] += 1
+        
+def RemoveSimpleCycles():
+    cheapTransitions = [transition for transition in X if Cost[transition] == 1]
+    subTours = FindAllSubTours(cheapTransitions)
+    for subTour in subTours:
+        transversedLocations = set(transition[0] for transition in subTour)
+        m.addConstr(
+                quicksum(X[i,j]
+                        for i in transversedLocations for j in transversedLocations
+                        if (i,j) in X
+                        ) <= len(subTour) - 1
+                )
+
+def IdentifyImproperEdges():
+    improperEdges = set()
+    for (i,j) in Cost:
+        for k in Destinations:
+            if (i,k) in Cost and (k,j) in Cost:
+                if Cost[i,k] + Cost[k,j] <= Cost[i,j]:
+                    improperEdges.add((i,j))
+                    break
+    return improperEdges    
+
+def IdentifyMaxCostEdges():
+    maxCostEdges = set()
+    for (i,j) in Cost:
+        if (Cost[(i,j)] > maxDesiredCost and i != 0):
+            maxCostEdges.add((i,j))
+    return maxCostEdges
+
+def CalculateCycleData(cycleLength):
+    # Apparently this isn't used.
+    
+    if cycleLength not in RemovedCycles:
+        print('Please choose another length')
+        return 0
+    
+    if len(RemovedCycles[cycleLength]) == 0:
+        return 0
+    
+    cycle = RemovedCycles[cycleLength][0]
+    
+    if (0,1) in cycle:
+        destination = 0
+    else:
+        transition = min(cycle)
+        cycle.remove(transition)
+        destination = transition[1]
+        cycle.add(transition)
+    
+    costString = ""
+    totalCost = 0
+    Transitions = {}
+    while len(cycle) > 0:
+        for transition in cycle:
+            if transition[0] == destination:
+                origin = transition[0]
+                destination = transition[1]
+                overlap = Overlap(origin, destination)
+                cost = order - overlap
+                costString += str(cost)
+                totalCost += cost
+                if cost not in Transitions:
+                    Transitions[cost] = [transition]
+                else:
+                    Transitions[cost].append(transition)
+                cycle.remove(transition)
+                break
+    RemovedCycles[cycleLength].remove(cycle)
+    if len(RemovedCycles[cycleLength]) == 0:
+        del RemovedCycles[cycleLength]
+    return (costString, totalCost, Transitions)
+
+def RemoveCostTwoCycles():
+    """
+    Removes all simple cycles with maximum cost of two.
+    
+    None -> None
+    
+    This function utilises the fact that each permutation has exactly
+    one proper transition of cost two in each direction.
+    
+    1. Choose a permutation from which to start the cycle.
+    2. Repeat until we have completed a cycle:
+        3. Repeat n-1 times:
+            4. Travel from the previous permutation using cost one transition
+        5. Travel from the previous permutation using cost two transition
+    6. Cut off cycle using a sub-tour elimination constraint
+    7. Continue until all simple cost-two cycles have been cut, that is,
+        until every single permutation has been an 'arriving permutation'
+        for a cost two transition 
+    """
+    SetOfPermutations = set(Permutations)
+    while len(SetOfPermutations) > 0:
+        cutPermutations = set()
+        startPermutation = min(SetOfPermutations)
+        nextPermutation = tuple(startPermutation)
+        while True:
+            for _ in range(order - 1):
+                (transition, nextPermutation) = IdentifyCostOneTransition(nextPermutation)
+                cutPermutations.add(transition)
+            (transition, nextPermutation) = IdentifyCostTwoTransition(nextPermutation)
+            SetOfPermutations.remove(nextPermutation)
+            cutPermutations.add(transition)
+            if nextPermutation == startPermutation:
+                break
+        AddCutFromTransitions(cutPermutations)
+
+def IdentifyCostOneTransition(permutation):
+    """
+    Takes a permutation, calculates the cost one transition, then
+    returns the transition and the other permutation in the transiton.
+    
+    permutation -> (transition, permutation)
+    """
+    secondPermutation = tuple(list(permutation[1:]) + list(permutation[0]))
+    permOneAddress = Permutations.index(permutation) + 1
+    permTwoAddress = Permutations.index(secondPermutation) + 1
+    transition = (permOneAddress, permTwoAddress)
+    return (transition, secondPermutation)
+
+def IdentifyCostTwoTransition(permutation):
+    """
+    Takes a permutation, calculates the cost two transition, then
+    returns the transition and the other permutation in the transiton.
+    
+    permutation -> (transition, permutation)
+    """
+    secondPermutation = tuple(list(permutation[2:]) + list(permutation[1]) + list(permutation[0]))
+    permOneAddress = Permutations.index(permutation) + 1
+    permTwoAddress = Permutations.index(secondPermutation) + 1
+    transition = (permOneAddress, permTwoAddress)
+    return (transition, secondPermutation)
+
+def AddCutFromTransitions(transitions):
+    """
+    Takes a set of transitions, then adds a sub-tour elimination constraint
+    from that set of transitions.
+    
+    set(transition) -> None
+    """
+    traversedLocations = set(transition[0] for transition in transitions)
+    m.addConstr(quicksum(
+                    X[i,j] for i in traversedLocations for j in traversedLocations 
+                    if (i,j) in X
+                    ) <= len(traversedLocations) - 1)
+
+def IdentifyStrongComponents(XVars):
+    ResetAllVertices()
+    FindAllNeighbours(XVars)
+    ListOfVertices = []
+    StrongComponents = {} # {root: [assigned vertices]}
+    for vertex in VertexStats:
+        Visit(vertex, ListOfVertices)
+    for vertex in ListOfVertices:
+        Assign(vertex, vertex, StrongComponents)
+    return list(StrongComponents.values())
+
+def ResetAllVertices():
+    for vertex in VertexStats:
+        VertexStats[vertex] = [[], [], False, False, 0]
+
+def FindAllNeighbours(XVars):
+    for (i,j) in XVars:
+        if XVars[(i,j)] > epsilon:
+            VertexStats[i][0] += [j]
+            VertexStats[j][1] += [i]
+
+def Visit(vertex, ListOfVertices):
+    if not VertexStats[vertex][2]:
+        VertexStats[vertex][2] = True
+        for vertexTwo in VertexStats[vertex][0]:
+            Visit(vertexTwo, ListOfVertices)
+        ListOfVertices.insert(0, vertex)
+
+def Assign(vertex, root, StrongComponents):
+    if not VertexStats[vertex][3]:
+        VertexStats[vertex][3] = True
+        VertexStats[vertex][4] = root
+        if root not in StrongComponents:
+            StrongComponents[root] = [vertex]
+        else:
+            StrongComponents[root].append(vertex)
+        for vertexTwo in VertexStats[vertex][1]:
+            Assign(vertexTwo, root, StrongComponents)
+        
+# =============================================================================
+                        
+timeStamp = time()
+
+runTimes = []
+print('Code version is', version)
+
+Alphabet = string.digits + string.ascii_letters
+
+if order < 10:
+    # Start choosing numbers from 1, rather than zero
+    UsedCharacters = Alphabet[1 : order+1]
+else:
+    UsedCharacters = Alphabet[:order]
+
+Permutations = list(itertools.permutations(UsedCharacters))
+permCount = len(Permutations)
+Destinations = {i+1: Permutations[i] for i in range(permCount)}
+Destinations[0] = 0
+# Cutoffs are the lengths of the shortest known superpermutation
+# of the order given by the key
+Cutoffs = {1:1, 2:3, 3:9, 4:33, 5:153, 6:872, 7:5906, 8:46205}
+LowerBounds = {1:1, 2:3, 3:9, 4:33, 5:153, 6:867, 7:5884, 8:46085}
+print('Finished defining sets, taking', time() - timeStamp, 'seconds')
+
+timeStamp = time()
+
+# Listing data
+Cost = {}
+for i in Destinations:
+    for j in Destinations:
+        if i != j:
+            if i == 0:
+                # Leaving from zero perm. Starting string
+                Cost[(i,j)] = order
+            elif j == 0:
+                # Arriving at zero perm. Finishing string
+                Cost[(i,j)] = 0
+            else:
+                Cost[(i,j)] = order - Overlap(i,j)
+print('Cost dictionary complete', time() - timeStamp)
+maxCostEdges = IdentifyMaxCostEdges()
+for transition in maxCostEdges:
+    del Cost[transition]
+print('Expensive edges removed', time() - timeStamp)
+if removeImproperArcs:
+    improperEdges = IdentifyImproperEdges()
+    for transition in improperEdges:
+        del Cost[transition]
+print('Improper edges removed', time() - timeStamp)
+VertexStats = {
+        d: [[], [], False, False, 0] for d in Destinations
+        } # out-neighbours, in-neighbours, visited, assigned, root
+epsilon = 0.001
+ListOfVertices = []
+extraCuts = 0
+print('Finished listing data, taking', time() - timeStamp, 'seconds')
+
+for seed in range(NumberOfTimesToRun):
+    
+    m = Model('Traveling Salesman Superpermutations')
+    m._bestObj = GRB.INFINITY
+    m._bestSol = None
+    
+    m.setParam('LazyConstraints', 1)
+    if branchingDirection != 0:
+        m.setParam('BranchDir', branchingDirection)
+    m.setParam('Seed', seed)
+    #m.setParam('GURO_PAR_MINBPFORBID', 1)
+    if upperBounds:
+        m.setParam('Cutoff', Cutoffs[order])
+    if mipFocus != 0:
+        m.setParam('MIPFocus', mipFocus)
+    m.setParam('OutputFlag', 0)
+
+    startTime = time()
+    timeStamp = time()
+    
+    # Constructing variables
+    # X = traveling between permutations
+    # We know (RTP) that transitions with maximum cost are not used
+    # in the solution, so we can ignore those.
+    X = {(i,j): m.addVar() for (i,j) in Cost}
+#    Y = m.addVar(vtype=GRB.INTEGER)
+#    Y.BranchPriority = 1
+    print('Finished constructing variables, taking', time() - timeStamp, 'seconds')
+    
+    # Objective function: minimise length of string/number of characters used
+    m.setObjective(quicksum(X[i,j]*Cost[i,j] for (i,j) in X), GRB.MINIMIZE)
+    
+    timeStamp = time()
+    
+    # Initiating constraints
+    m.addConstr(X[0,1] == 1) # To reduce symmetry, choose first Destination
+    FlowConstraint = {i:
+        m.addConstr(
+                quicksum(X[i,j] for j in Destinations if (i,j) in X)
+                == quicksum(X[j,i] for j in Destinations if (j,i) in X)
+                )
+        for i in Destinations}
+    VisitEveryPermutation = {i:
+        m.addConstr(
+                quicksum(X[i,j] for j in Destinations if (i,j) in X) == 1
+                )
+        for i in Destinations}
+    if removeCostOneCycles and order > 1:
+        RemoveSimpleCycles()
+    if order > 2 and removeCostTwoCycles:
+        RemoveCostTwoCycles()
+    if lowerBounds:
+        m.addConstr(quicksum(X[i,j]*Cost[i,j] for (i,j) in X) >= LowerBounds[order])
+    if maxAndMinTransitionsOfCostAssumptions:
+        if order > 1:
+            m.addConstr(quicksum(X[i,j] for (i,j) in X if Cost[i,j] == 1) == (order-1) * f(order-1))
+        if order > 2:
+            m.addConstr(quicksum(X[i,j] for (i,j) in X if Cost[i,j] == 2) <= f(order-1) - f(order-2))
+        if order > 3:
+            m.addConstr(quicksum(X[i,j] for (i,j) in X if Cost[i,j] == 3) >= f(order-2) - 1)
+    if partitionVariable == 0:
+        m.addConstr(X[1,154] == 0)
+    if partitionVariable == 1:
+        m.addConstr(X[1,154] == 1)
+        m.addConstr(X[154,305] == 0)
+    if partitionVariable == 2:
+        m.addConstr(X[1,154] + X[154,305] == 2)
+        m.addConstr(X[305,451] == 0)
+    if partitionVariable == 3:
+        m.addConstr(X[1,154] + X[154,305] + X[305,451] == 3)
+        m.addConstr(X[451,577] == 0)
+    if partitionVariable == 4:
+        m.addConstr(X[1,154] + X[154,305] + X[305,451] + X[451,577] == 4)
+        m.addConstr(X[577,601] == 0)
+    if partitionVariable == 5:
+        m.addConstr(X[1,154] + X[154,305] + X[305,451] + X[451,577] + X[577,601] == 5)
+    print('Finished initiating constraints, taking', time() - timeStamp, 'seconds')
+    
+    WarmStartCutStats = {}
+    if warmStart:
+        print('Warm Start')
+        while True:
+            constraintsAdded = False
+            m.optimize()
+            XVars = {x:X[x].x for x in X}
+            strongComponents = IdentifyStrongComponents(XVars)
+            if len(strongComponents) > 1:
+                for component in strongComponents:
+                    m.addConstr(quicksum(X[i,j] for i in component for j in component if (i,j) in X) <= len(component)-1)
+                    constraintsAdded = True
+                if len(strongComponents) not in WarmStartCutStats:
+                    WarmStartCutStats[len(strongComponents)] = 1
+                else:
+                    WarmStartCutStats[len(strongComponents)] += 1
+            if not constraintsAdded:
+                break
+    for x in X:
+        X[x].vtype = GRB.BINARY
+    
+    if output:
+        m.setParam('OutputFlag', 1)
+    
+    print('Beginning optimisation and removal of subtours')
+    CutStats = {}
+    StrongComponentCutStats = {}
+    RemovedCycles = {}
+    SubTourLengthStats = {}
+    
+    m.optimize(Callback)
+    
+    subTours = FindAllSubTours(GetUsedXVariables())
+    permutationTour = subTours[0]
+    string = ""
+    destination = 0
+    # Go through the found route, printing out the overall string
+    while len(permutationTour) > 0:
+        for transition in permutationTour:
+            if transition[0] == destination:
+                destination = transition[1]
+                permutationTour.remove(transition)
+                if destination != 0:
+                    permTwo = Destinations[destination]
+                    for i in permTwo[Overlap(transition[0], destination):]:
+                        string += i
+                break
+    endTime = time()
+    runTimes.append(endTime - startTime)
+    print('Time taken using seed', seed, 'is', endTime - startTime, 'seconds.\n')
+    
+print('The shortest string found fulfilling the required conditions is', string)
+print('The average run-time is', sum(runTimes) / NumberOfTimesToRun, "seconds.")
+print('Run Times:', runTimes)
